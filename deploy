@@ -1,0 +1,9 @@
+#!/bin/sh
+
+. ./common.sh
+
+./build
+
+sftp lanpi <<EOF
+	put -fR $OUT/* bots/180bot
+EOF

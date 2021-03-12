@@ -1,0 +1,7 @@
+#!/bin/sh
+
+. ./common.sh
+
+rm -rf $TMP $OUT
+rm -rf *.180days
+rm -rf __pycache__/

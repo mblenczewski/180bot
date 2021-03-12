@@ -1,0 +1,5 @@
+*.conf
+*.180days
+
+__pycache__/
+env/

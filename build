@@ -1,0 +1,5 @@
+#!/bin/sh
+
+. ./common.sh
+
+cp requirements.txt run.sh 180bot.service bot.py token.conf channel.conf $OUT
