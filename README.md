@@ -1,3 +1,3 @@
 # 180bot
 
-A private discord bot for the 180days server
+A Discord bot written for a private server
