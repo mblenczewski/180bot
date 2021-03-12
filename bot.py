@@ -29,15 +29,15 @@ def command(keys: list[str] = [], params: list[str] = [], usage: str = 'No usage
     return inner
 
 
-QUOTE_REFRESH_SEC = 60
+QUOTE_REFRESH_SEC = 300
 QUOTE_HISTORY_FILE = 'quotes.180days'
 QUOTE_AUTHORS_FILE = 'authors.180days'
 QUOTE_REFRESH_FILE = 'last_reload_time.180days'
 
 
 def rindex(s, v):
-    for i in range(len(s)-1, -1, -1):
-        if s[i] == v:
+    for i in range(len(s)-len(v), -1, -1):
+        if s[i:i+len(v)] == v:
             return i
 
     return None
@@ -48,8 +48,12 @@ def format_author_name(name):
     return  f'{name[0].upper()}{name[1:]}'
 
 
-def create_embed(title, description, color=discord.Color.gold()):
+def embed(title, description, color=discord.Color.gold()):
     return discord.Embed(color=color, title=title, description=description)
+
+
+def err_embed(title, description, color=discord.Color.red()):
+    return embed(title, description, color=color)
 
 
 class BotClient(discord.Client):
@@ -106,19 +110,35 @@ class BotClient(discord.Client):
 
     async def update_quotes(self, history, channel, limit=None, after=None):
         async for msg in channel.history(limit=limit, after=after, oldest_first=True):
-            if (hyphen_rindex := rindex(msg.content, '-')) is None:
+            try:
+                # ignore bot responses
+                if msg.author.name == self.user.name:
+                    continue
+
+                # ignore bot invocations
+                if msg.content.startswith(PREFIX):
+                    continue
+
+                # loose message format check
+                if (hyphen_rindex := rindex(msg.content, '- ')) is None:
+                    continue
+
+                author = format_author_name(msg.content[hyphen_rindex+1:])
+
+                if ' me ' in f' {author.lower()} ':
+                    author = format_author_name(msg.author.display_name)
+
+                if author not in self.authors:
+                    self.authors[author] = {'total': 1, 'quotes': [msg.content]}
+                else:
+                    self.authors[author]['total'] += 1
+                    self.authors[author]['quotes'].append(msg.content)
+
+                self.quotes.append({'author': author, 'quote': msg.content})
+
+            except Exception as err:
+                print(f'"{msg.content}" gives error {err}')
                 continue
-
-            author = msg.content[hyphen_rindex+1:].lstrip().lower()
-            author = format_author_name(author)
-
-            if author not in self.authors:
-                self.authors[author] = {'total': 1, 'quotes': [msg.content]}
-            else:
-                self.authors[author]['total'] += 1
-                self.authors[author]['quotes'].append(msg.content)
-
-            self.quotes.append({'author': author, 'quote': msg.content})
 
         self.write_last_reload_time(datetime.datetime.now())
         self.write_authors()
@@ -177,7 +197,12 @@ class BotClient(discord.Client):
         if prefix == PREFIX and 0 < len(key):
             for command, handler in COMMANDS.items():
                 if key == command:
-                    await handler(self, message.channel, params)
+                    try:
+                        await handler(self, message.channel, params)
+                    except Exception as err:
+                        print(f'Error duing {command} handler (params: {params}):\n{err}')
+                        error = err_embed('Error', 'Invalid usage! Please see .help or .usage')
+                        await message.channel.send(embed=error)
                     break
             else:
                 print(f'Unknown command: "{key}" with parameters {params}')
@@ -189,11 +214,11 @@ class BotClient(discord.Client):
         for key in COMMANDS:
             description, parameters = DESCRIPTIONS[key], PARAMETERS[key]
 
-            response += f'\t{PREFIX}{key} :\n'
-            response += f'\t\tUsage: {PREFIX}{key} {" ".join(parameters)}\n'
-            response += f'\t\tDescription: {description}\n'
+            response += f'  {PREFIX}{key} :\n'
+            response += f'    Usage: {PREFIX}{key} {" ".join(parameters)}\n'
+            response += f'    Description: {description}\n'
 
-        await channel.send(embed=create_embed('Usage', response))
+        await channel.send(embed=embed('Usage', response))
 
 
     @command(keys=['ping'], params=[], usage='Returns with a pong')
@@ -211,45 +236,50 @@ class BotClient(discord.Client):
 
         response += f'Total Quotes: {total_quotes}'
 
-        await channel.send(embed=create_embed('Quote Tally', response))
+        await channel.send(embed=embed('Quote Tally', response))
 
 
     @command(keys=['quote'], params=[], usage='Gets a random quote')
     async def quote(self, channel, params):
         index = random.randint(0, len(self.quotes)-1)
 
-        response = self.quotes[index]['quote']
-
-        await channel.send(embed=create_embed(f'Quote #{index}', response))
+        await channel.send(embed=embed(f'Quote #{index}', self.quotes[index]['quote']))
 
 
-    @command(keys=['uquote'], params=['<userame:str>'], usage='Gets a random quote from the given user')
+    @command(keys=['uquote'], params=['<username:str>'], usage='Gets a random quote from the given user')
     async def user_quote(self, channel, params):
-        response = ''
+        author = format_author_name(' '.join(params))
+        author_quotes = self.authors[author]['quotes']
+        index = random.randint(0, len(author_quotes)-1) 
 
-        try:
-            author = format_author_name(params[0])
-            response = random.choice(self.authors[author]['quotes']) 
-        except Exception as err:
-            response = 'Invalid usage! Please see .help or .usage'
-            await channel.send(embed=create_embed('Error', response, discord.Color.red()))
-            return
+        await channel.send(embed=embed(f'{author}\'s Quote #{index}', author_quotes[index]))
 
-        await channel.send(embed=create_embed('User Quote', response))
+
+    @command(keys=['uhistory'], params=['<username:str'], usage='Gets the given users quote history')
+    async def user_history(self, channel, params):
+        author = format_author_name(' '.join(params))
+        author_quotes = self.authors[author]['quotes']
+
+        response, page = '', 1
+        for idx, quote in enumerate(author_quotes):
+                if 2048 <= len(response) + len(quote):
+                    await channel.send(embed=embed(f'{author}\'s History ({page})', response))
+                    response = ''
+                    page += 1
+
+                response += f'#{idx}: {quote}\n'
+
+        await channel.send(embed=embed(f'{author}\'s History ({page})', response))
 
 
     @command(keys=['iquote'], params=['<index:int>'], usage='Gets the quote with the given index')
     async def index_quote(self, channel, params):
-        response = ''
+        index = int(params[0])
 
-        try:
-            response = self.quotes[int(params[0])]['quote']
-        except Exception as err:
-            response = 'Invalid usage! Please see .help or .usage'
-            await channel.send(embed=create_embed('Error', response, discord.Color.red()))
-            return
+        if index < 0 or len(self.quotes) <= index:
+            raise ValueError(f'given index {index} is out of bounds')
 
-        await channel.send(embed=create_embed(f'Quote #{params[0]}', response))
+        await channel.send(embed=embed(f'Quote #{index}', self.quotes[index]['quote']))
 
 
 def main():
