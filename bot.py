@@ -10,6 +10,7 @@ import discord
 
 TOKEN_FILE = 'token.conf'
 CHANNEL_FILE = 'channel.conf'
+ALIASES_FILE = 'aliases.conf'
 
 PREFIX = '.'
 COMMANDS = dict()
@@ -30,9 +31,8 @@ def command(keys: list[str] = [], params: list[str] = [], usage: str = 'No usage
 
 
 QUOTE_REFRESH_SEC = 300
-QUOTE_HISTORY_FILE = 'quotes.180days'
-QUOTE_AUTHORS_FILE = 'authors.180days'
-QUOTE_REFRESH_FILE = 'last_reload_time.180days'
+QUOTE_FILE = 'authors.180days'
+QUOTE_TIMESTAMP_FILE = 'last_reload_time.180days'
 
 
 def rindex(s, v):
@@ -43,69 +43,61 @@ def rindex(s, v):
     return None
 
 
-def format_author_name(name):
+def fmt_name(name):
     name = name.lower().strip()
     return  f'{name[0].upper()}{name[1:]}'
 
 
-def embed(title, description, color=discord.Color.gold()):
-    return discord.Embed(color=color, title=title, description=description)
+def fmt_datetime(val):
+    return val.strftime('%Y/%m/%d')
 
 
-def err_embed(title, description, color=discord.Color.red()):
-    return embed(title, description, color=color)
+def embed(title, description, footer='', colour=discord.Color.gold()):
+    embed = discord.Embed(title=title, description=description, colour=colour)
+    embed.set_footer(text=footer)
+    return embed
+
+
+def err_embed(title, description, footer='', colour=discord.Color.red()):
+    return embed(title, description, footer, colour)
 
 
 class BotClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.authors = self.read_authors()
         self.quotes = self.read_quotes()
 
         self.reload_quote_task = self.loop.create_task(self.bg_reload_quotes())
 
 
-    def read_last_reload_time(self):
-        if not os.path.isfile(QUOTE_REFRESH_FILE):
+    def read_timestamp(self):
+        if not os.path.isfile(QUOTE_TIMESTAMP_FILE):
             return None
         
-        with open(QUOTE_REFRESH_FILE, 'r') as last_reload:
+        with open(QUOTE_TIMESTAMP_FILE, 'r') as f:
             try:
-                return datetime.datetime.fromisoformat(last_reload.read().strip())
+                return datetime.datetime.fromisoformat(f.read().strip())
             except:
                 return None
 
 
-    def write_last_reload_time(self, datetime):
-        with open(QUOTE_REFRESH_FILE, 'w') as last_reload:
-            last_reload.write(datetime.isoformat())
-
-
-    def read_authors(self):
-        if not os.path.isfile(QUOTE_AUTHORS_FILE):
-            return dict()
-
-        with open(QUOTE_AUTHORS_FILE, 'r') as authors_file:
-            return json.loads(authors_file.read())
-
-
-    def write_authors(self):
-        with open(QUOTE_AUTHORS_FILE, 'w') as authors_file:
-            authors_file.write(json.dumps(self.authors, indent=4))
+    def write_timestamp(self, datetime):
+        with open(QUOTE_TIMESTAMP_FILE, 'w') as f:
+            f.write(datetime.isoformat())
 
 
     def read_quotes(self):
-        if not os.path.isfile(QUOTE_HISTORY_FILE):
-            return []
+        if not os.path.isfile(QUOTE_FILE):
+            return dict()
 
-        with open(QUOTE_HISTORY_FILE, 'r') as quote_file:
-            return json.loads(quote_file.read())
+        with open(QUOTE_FILE, 'r') as f:
+            return json.loads(f.read())
 
 
     def write_quotes(self):
-        with open(QUOTE_HISTORY_FILE, 'w') as quote_file:
-            quote_file.write(json.dumps(self.quotes, indent=4))
+        with open(QUOTE_FILE, 'w') as f:
+            f.write(json.dumps(self.quotes, indent=4))
 
 
     def get_quote_split(self, quote):
@@ -118,36 +110,30 @@ class BotClient(discord.Client):
         return None
 
 
-    async def update_quotes(self, history, channel, limit=None, after=None):
+    async def update_quotes(self, channel, limit=None, after=None):
         async for msg in channel.history(limit=limit, after=after, oldest_first=True):
             try:
-                # ignore bot responses
                 if msg.author.name == self.user.name:
                     continue
 
-                # loose message format check
                 if (quote_split := self.get_quote_split(msg.content)) is None:
                     continue
 
-                author = format_author_name(msg.content[quote_split+1:])
+                author = fmt_name(msg.content[quote_split+1:])
 
                 if ' Me ' == f' {author} ':
-                    author = format_author_name(msg.author.display_name)
+                    author = fmt_name(msg.author.display_name)
 
-                if author not in self.authors:
-                    self.authors[author] = {'total': 1, 'quotes': [msg.content]}
-                else:
-                    self.authors[author]['total'] += 1
-                    self.authors[author]['quotes'].append(msg.content)
-
-                self.quotes.append({'author': author, 'quote': msg.content})
+                status = self.quotes.get(author, {'total': 0, 'quotes': []})
+                status['total'] += 1
+                status['quotes'].append((msg.content, fmt_datetime(msg.created_at), msg.jump_url))
+                self.quotes[author] = status
 
             except Exception as err:
                 print(f'"{msg.content}" gives error {err}')
                 continue
 
-        self.write_last_reload_time(datetime.datetime.now())
-        self.write_authors()
+        self.write_timestamp(datetime.datetime.now())
         self.write_quotes()
 
         print(f'Updated quote history at {datetime.datetime.now().strftime("%H:%M:%S")}')
@@ -172,20 +158,15 @@ class BotClient(discord.Client):
         print(f'Fetched source channel: #{channel}')
 
         try:
-            # if missing message history file, recreate it
-            if not os.path.isfile(QUOTE_HISTORY_FILE):
-                with open(QUOTE_HISTORY_FILE, 'w') as history:
-                    await self.update_quotes(history, channel)
+            if not os.path.isfile(QUOTE_FILE):
+                await self.update_quotes(channel)
             else:
-                with open(QUOTE_HISTORY_FILE, 'a') as history:
-                    await self.update_quotes(history, channel, after=self.read_last_reload_time())
+                await self.update_quotes(channel, after=self.read_timestamp())
 
-            # update the quote history file every so often
             while not self.is_closed():
                 await asyncio.sleep(QUOTE_REFRESH_SEC)
 
-                with open(QUOTE_HISTORY_FILE, 'a') as history:
-                    await self.update_quotes(history, channel, after=self.read_last_reload_time())
+                await self.update_quotes(history, channel, after=self.read_timestamp())
 
         except Exception as err:
             print(err)
@@ -193,7 +174,6 @@ class BotClient(discord.Client):
 
     async def bg_reminder(self, author, minutes, message, set_date):
         await asyncio.sleep(minutes * 60)
-        # await author.send(f'(@{set_date}) Reminder: {message}')
         await author.send(f'Reminder: {message}')
 
 
@@ -202,20 +182,16 @@ class BotClient(discord.Client):
             return
 
         prefix = message.content[:len(PREFIX)]
-        parts = message.content[len(PREFIX):].strip().split(' ')
-
-        key, params = parts[0], parts[1:]
+        [key, *params] = message.content[len(PREFIX):].strip().split(' ')
 
         if prefix == PREFIX and 0 < len(key):
-            for command, handler in COMMANDS.items():
-                if key == command:
-                    try:
-                        await handler(self, message.author, message.channel, params)
-                    except Exception as err:
-                        print(f'Error duing {command} handler (params: {params}):\n{err}')
-                        error = err_embed('Error', f'{err}\nInvalid usage! Please see .help or .usage')
-                        await message.channel.send(embed=error)
-                    break
+            if (handler := COMMANDS.get(key, None)) is not None:
+                try:
+                    await handler(self, message.author, message.channel, params)
+                except Exception as err:
+                    print(f'Error duing {command} handler (params: {params}):\n{err}')
+                    error = err_embed('Error', f'{err}\nInvalid usage! Please see .help or .usage')
+                    await message.channel.send(embed=error)
             else:
                 print(f'Unknown command: "{key}" with parameters {params}')
 
@@ -238,52 +214,45 @@ class BotClient(discord.Client):
        await channel.send('pong')
 
 
-    @command(keys=['totals', 'tally'], params=[], usage='Quote totals per person')
+    @command(keys=['tally'], params=[], usage='Quote totals per person')
     async def totals(self, author, channel, params):
         response, total_quotes= 'Quotes per capita:\n', 0
 
-        for author, info in self.authors.items():
-            response += f'\t{author}: {info["total"]} quotes\n'
-            total_quotes += info['total']
+        for author, status in self.quotes.items():
+            response += f'\t{author}: {status["total"]} quotes\n'
+            total_quotes += status['total']
 
         response += f'Total Quotes: {total_quotes}'
 
         await channel.send(embed=embed('Quote Tally', response))
 
 
-    @command(keys=['quote'], params=[], usage='Gets a random quote')
-    async def quote(self, author, channel, params):
-        index = random.randint(0, len(self.quotes)-1)
-
-        await channel.send(embed=embed(f'Quote #{index}', self.quotes[index]['quote']))
-
-
-    @command(keys=['uquote'], params=['<username:str>'], usage='Gets a random quote from the given user')
+    @command(keys=['random'], params=['<username:str>'], usage='Gets a random quote from the given user')
     async def user_quote(self, author, channel, params):
-        author = format_author_name(' '.join(params))
-        author_quotes = self.authors[author]['quotes']
-        index = random.randint(0, len(author_quotes)-1) 
+        if len(params) == 0:
+            author = random.choice(list(self.quotes.keys()))
+        else:
+            author = fmt_name(' '.join(params))
+        
+        quotes = self.quotes[author]['quotes']
+        i = random.randint(0, len(quotes)-1)
 
-        await channel.send(embed=embed(f'{author}\'s Quote #{index}', author_quotes[index]))
+        title = f'{author} Quote #{i+1}'
+        quote, timestamp, link = quotes[i]
+        footer = f'{timestamp}'
+
+        await channel.send(embed=embed(title, quote, footer))
 
 
-    @command(keys=['uiquote'], params=['<username:str>', '<index:int>'], usage='')
-    async def user_indexed_quote(self, author, channel, params):
-        author = format_author_name(' '.join(params[:-1]))
-        author_quotes = self.authors[author]['quotes']
-        index = int(params[-1])
-
-        await channel.send(embed=embed(f'{author}\'s Quote #{index}', author_quotes[index]))
-
-
-    @command(keys=['uhistory'], params=['<username:str>'], usage='Gets the given users quote history')
+    @command(keys=['history'], params=['<username:str>'], usage='Gets the given users quote history')
     async def user_history(self, author, channel, params):
-        author = format_author_name(' '.join(params))
-        author_quotes = self.authors[author]['quotes']
+        author = fmt_name(' '.join(params))
+        quotes = self.quotes[author]['quotes']
 
         response, page = '', 1
-        for idx, quote in enumerate(author_quotes):
-            formatted_quote = f'#{idx}: {quote}\n'
+        for i, tup in enumerate(quotes):
+            quote, timestamp, link = tup
+            formatted_quote = f'#{i+1}: {quote}\n'
 
             if 2048 <= len(response) + len(formatted_quote):
                 await channel.send(embed=embed(f'{author}\'s History ({page})', response))
@@ -293,29 +262,6 @@ class BotClient(discord.Client):
             response += formatted_quote
 
         await channel.send(embed=embed(f'{author}\'s History ({page})', response))
-
-
-    @command(keys=['iquote'], params=['<index:int>'], usage='Gets the quote with the given index')
-    async def index_quote(self, author, channel, params):
-        index = int(params[0])
-
-        if index < 0 or len(self.quotes) <= index:
-            raise ValueError(f'given index {index} is out of bounds')
-
-        await channel.send(embed=embed(f'Quote #{index}', self.quotes[index]['quote']))
-
-
-    @command(keys=['test'], params=['<quote:str>'], usage='Checks whether a quote would be accepted')
-    async def test_quote(self, author, channel, params):
-        quote = ' '.join(params)
-        response = ''
-
-        if (quote_split := self.get_quote_split(quote)) is None:
-            response = 'Quote not accepted!'
-        else:
-            response = f'Quote accepted! Author separator index: {quote_split}'
-
-        await channel.send(embed=embed(f'Quote Test: \'{quote}\'', response))
 
 
     @command(keys=['remind'], params=['<time:int> <scale:hr|min> - <message:str>'], usage='Reminds you about a message after a given time')
