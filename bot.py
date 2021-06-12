@@ -31,7 +31,7 @@ def command(keys: list[str] = [], params: list[str] = [], usage: str = 'No usage
 
 
 QUOTE_REFRESH_SEC = 300
-QUOTE_FILE = 'authors.180days'
+QUOTE_FILE = 'quotes.180days'
 QUOTE_TIMESTAMP_FILE = 'last_reload_time.180days'
 
 
@@ -44,8 +44,8 @@ def rindex(s, v):
 
 
 def fmt_name(name):
-    name = name.lower().strip()
-    return  f'{name[0].upper()}{name[1:]}'
+    name = name.lower().strip().split(' ')
+    return  ' '.join([f'{v[0].upper()}{v[1:]}' for v in name]).strip()
 
 
 def fmt_datetime(val):
@@ -66,38 +66,76 @@ class BotClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        self.aliases = self.read_aliases()
+        self.flat_inv_aliases = {v: k for k, vs in self.aliases.items() for v in vs}
         self.quotes = self.read_quotes()
 
         self.reload_quote_task = self.loop.create_task(self.bg_reload_quotes())
 
 
-    def read_timestamp(self):
-        if not os.path.isfile(QUOTE_TIMESTAMP_FILE):
+    def read(self, fpath):
+        if not os.path.isfile(fpath):
             return None
-        
-        with open(QUOTE_TIMESTAMP_FILE, 'r') as f:
-            try:
-                return datetime.datetime.fromisoformat(f.read().strip())
-            except:
-                return None
+
+        with open(fpath, 'r') as f:
+            return f.read()
+
+
+    def write(self, fpath, value):
+        with open(fpath, 'w') as f:
+            f.write(value)
+
+
+    def read_aliases(self):
+        aliases = dict()
+        for key, value in json.loads(self.read(ALIASES_FILE)).items():
+            aliases[key.lower().strip()] = [v.lower().strip() for v in value]
+
+        return aliases
+
+
+    def write_aliases(self):
+        self.write(ALIASES_FILE, json.dumps(self.aliases, indent=4))
+
+
+    def read_timestamp(self):
+        timestamp = self.read(QUOTE_TIMESTAMP_FILE).strip()
+        return datetime.datetime.fromisoformat(timestamp) if timestamp is not None else None
 
 
     def write_timestamp(self, datetime):
-        with open(QUOTE_TIMESTAMP_FILE, 'w') as f:
-            f.write(datetime.isoformat())
+        self.write(QUOTE_TIMESTAMP_FILE, datetime.isoformat())
 
 
     def read_quotes(self):
-        if not os.path.isfile(QUOTE_FILE):
-            return dict()
-
-        with open(QUOTE_FILE, 'r') as f:
-            return json.loads(f.read())
+        quotes = self.read(QUOTE_FILE)
+        return json.loads(quotes) if quotes is not None else dict()
 
 
     def write_quotes(self):
-        with open(QUOTE_FILE, 'w') as f:
-            f.write(json.dumps(self.quotes, indent=4))
+        self.write(QUOTE_FILE, json.dumps(self.quotes, indent=4))
+
+
+    def add_alias(self, author, alias):
+        alias = alias.lower().strip()
+        if alias not in self.aliases[author]:
+            self.aliases[author].append(alias)
+        if alias not in self.flat_inv_aliases:
+            self.flat_inv_aliases[alias] = author
+        self.write_aliases()
+
+
+    def del_alias(self, author, alias):
+        alias = alias.lower().strip()
+        if alias in self.aliases[author]:
+            self.aliases[author].remove(alias)
+        if alias in self.flat_inv_aliases:
+            del self.flat_inv_aliases[alias]
+        self.write_aliases()
+
+
+    def resolve_alias(self, name):
+        return self.flat_inv_aliases.get(name.lower().strip(), name.lower().strip())
 
 
     def get_quote_split(self, quote):
@@ -116,17 +154,23 @@ class BotClient(discord.Client):
                 if msg.author.name == self.user.name:
                     continue
 
+                # TODO(mikolaj): find better way of distinguishing quotes from 
+                # non-quotes. preferrably have single quote format
                 if (quote_split := self.get_quote_split(msg.content)) is None:
                     continue
 
-                author = fmt_name(msg.content[quote_split+1:])
+                author = msg.content[quote_split+1:].lower().strip()
 
-                if ' Me ' == f' {author} ':
-                    author = fmt_name(msg.author.display_name)
+                if ' me ' == f' {author} ':
+                    author = msg.author.display_name
+
+                author = fmt_name(self.resolve_alias(author))
+
+                new_quote = [msg.content, fmt_datetime(msg.created_at), msg.jump_url]
 
                 status = self.quotes.get(author, {'total': 0, 'quotes': []})
                 status['total'] += 1
-                status['quotes'].append((msg.content, fmt_datetime(msg.created_at), msg.jump_url))
+                status['quotes'].append(new_quote)
                 self.quotes[author] = status
 
             except Exception as err:
@@ -166,7 +210,7 @@ class BotClient(discord.Client):
             while not self.is_closed():
                 await asyncio.sleep(QUOTE_REFRESH_SEC)
 
-                await self.update_quotes(history, channel, after=self.read_timestamp())
+                await self.update_quotes(channel, after=self.read_timestamp())
 
         except Exception as err:
             print(err)
@@ -178,6 +222,8 @@ class BotClient(discord.Client):
 
 
     async def on_message(self, message):
+        import traceback
+
         if message.author == self.user:
             return
 
@@ -189,24 +235,34 @@ class BotClient(discord.Client):
                 try:
                     await handler(self, message.author, message.channel, params)
                 except Exception as err:
-                    print(f'Error duing {command} handler (params: {params}):\n{err}')
+                    traceback.print_exc()
                     error = err_embed('Error', f'{err}\nInvalid usage! Please see .help or .usage')
                     await message.channel.send(embed=error)
             else:
                 print(f'Unknown command: "{key}" with parameters {params}')
 
 
-    @command(keys=['help', 'usage'], params=[], usage='Displays usage information')
+    @command(keys=['help', 'usage'], params=['[command:str]'], usage='Displays usage information')
     async def usage(self, author, channel, params):
-        response = 'Available Commands:\n'
-        for key in COMMANDS:
+        if len(params) == 0:
+            response = 'Available Commands:\n'
+            for key in COMMANDS:
+                description, parameters = DESCRIPTIONS[key], PARAMETERS[key]
+
+                response += f'  {PREFIX}{key} :\n'
+                response += f'    Usage: {PREFIX}{key} {" ".join(parameters)}\n'
+                response += f'    Description: {description}\n'
+
+            await channel.send(embed=embed('Usage', response))
+        else:
+            key = params[0]
             description, parameters = DESCRIPTIONS[key], PARAMETERS[key]
 
-            response += f'  {PREFIX}{key} :\n'
-            response += f'    Usage: {PREFIX}{key} {" ".join(parameters)}\n'
-            response += f'    Description: {description}\n'
+            response =  f'{PREFIX}{key} :\n'
+            response += f'  Usage: {PREFIX}{key} {" ".join(parameters)}\n'
+            response += f'  Description: {description}'
 
-        await channel.send(embed=embed('Usage', response))
+            await channel.send(embed=embed(f'{key} Usage', response))
 
 
     @command(keys=['ping'], params=[], usage='Returns with a pong')
@@ -214,9 +270,35 @@ class BotClient(discord.Client):
        await channel.send('pong')
 
 
+    @command(keys=['alias'], params=['add|del|ls', '<alias:str>'], usage='Add or remove aliases')
+    async def alias(self, author, channel, params):
+        [verb, *new_alias] = params
+
+        if len(new_alias) == 0:
+            raise Exception('No alias given!')
+
+        formatted_id = f'<@{author.id}>'
+        author = self.resolve_alias(formatted_id)
+        if author == formatted_id:
+            pass
+
+        if verb == 'add':
+            self.add_alias(author, fmt_name(' '.join(new_alias)))
+        elif verb == 'del':
+            self.del_alias(author, fmt_name(' '.join(new_alias)))
+        elif verb == ls:
+            pass
+        else:
+            raise Exception(f'Unknown verb given: {verb}')
+
+        response = ' '.join(self.aliases[author])
+
+        await channel.send(embed=embed(f'{fmt_name(author)}\'s Aliases', response))
+
+
     @command(keys=['tally'], params=[], usage='Quote totals per person')
     async def totals(self, author, channel, params):
-        response, total_quotes= 'Quotes per capita:\n', 0
+        response, total_quotes = 'Quotes per capita:\n', 0
 
         for author, status in self.quotes.items():
             response += f'\t{author}: {status["total"]} quotes\n'
@@ -227,12 +309,12 @@ class BotClient(discord.Client):
         await channel.send(embed=embed('Quote Tally', response))
 
 
-    @command(keys=['random'], params=['<username:str>'], usage='Gets a random quote from the given user')
+    @command(keys=['random'], params=['[username:str]'], usage='Gets a random quote (optionally from the given user)')
     async def user_quote(self, author, channel, params):
         if len(params) == 0:
             author = random.choice(list(self.quotes.keys()))
         else:
-            author = fmt_name(' '.join(params))
+            author = fmt_name(self.resolve_alias(' '.join(params)))
         
         quotes = self.quotes[author]['quotes']
         i = random.randint(0, len(quotes)-1)
@@ -246,7 +328,7 @@ class BotClient(discord.Client):
 
     @command(keys=['history'], params=['<username:str>'], usage='Gets the given users quote history')
     async def user_history(self, author, channel, params):
-        author = fmt_name(' '.join(params))
+        author = fmt_name(self.resolve_alias(' '.join(params)))
         quotes = self.quotes[author]['quotes']
 
         response, page = '', 1
